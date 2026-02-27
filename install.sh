@@ -348,12 +348,140 @@ renew_cert() {
 }
 
 # ============================================================
+# 工具函数
+# ============================================================
+
+# 生成随机密码（UUID 格式）
+generate_password() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+    else
+        cat /proc/sys/kernel/random/uuid 2>/dev/null || head -c 32 /dev/urandom | md5sum | head -c 32
+    fi
+}
+
+# 生成随机端口（10000-60000）
+generate_port() {
+    shuf -i 10000-60000 -n 1 2>/dev/null || echo $(( RANDOM % 50000 + 10000 ))
+}
+
+# 获取公网 IP
+get_public_ip() {
+    curl -s --connect-timeout 5 https://api.ipify.org 2>/dev/null || \
+    curl -s --connect-timeout 5 https://ifconfig.me 2>/dev/null || \
+    curl -s --connect-timeout 5 https://ip.sb 2>/dev/null || \
+    echo ""
+}
+
+# 从配置文件读取值
+get_config_value() {
+    local key="$1"
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        grep "^${key}:" "${CONFIG_FILE}" 2>/dev/null | head -1 | sed 's/^[^:]*: *//;s/^"//;s/"$//'
+    fi
+}
+
+# ============================================================
 # 交互式配置向导
 # ============================================================
 
-# 配置向导
-setup_config() {
-    echoContent skyBlue "\n开始配置 AnytlsServer..."
+# 安装模式选择
+choose_install_mode() {
+    echoContent skyBlue "\n请选择安装模式："
+    echoContent red "=============================================================="
+    echoContent yellow "1. 独立模式 - 单用户，不依赖面板，快速测试"
+    echoContent yellow "2. Xboard 模式 - 多用户，对接 Xboard 面板管理"
+    echoContent red "=============================================================="
+
+    local mode=""
+    while [[ "${mode}" != "1" && "${mode}" != "2" ]]; do
+        read -r -p "请选择 [1/2]: " mode
+    done
+
+    if [[ "${mode}" == "1" ]]; then
+        setup_standalone_config
+    else
+        setup_xboard_config
+    fi
+}
+
+# 独立模式配置
+setup_standalone_config() {
+    echoContent skyBlue "\n配置独立模式..."
+    echoContent red "=============================================================="
+
+    # 密码
+    local default_password
+    default_password=$(generate_password)
+    read -r -p "请输入密码（留空自动生成）: " input_password
+    local password="${input_password:-${default_password}}"
+
+    # 端口
+    local default_port
+    default_port=$(generate_port)
+    read -r -p "请输入监听端口（留空随机生成，默认 ${default_port}）: " input_port
+    local listen_port="${input_port:-${default_port}}"
+
+    # 域名（可选）
+    local domain=""
+    read -r -p "请输入域名（用于 TLS 证书，留空使用自签名证书）: " domain
+
+    # 创建目录
+    mkdir -p "${CONFIG_DIR}"
+    mkdir -p "${LOG_DIR}"
+
+    # TLS 配置
+    local cert_config="tls:
+  cert_file: \"\"
+  key_file: \"\""
+    if [[ -n "${domain}" ]]; then
+        cert_config="tls:
+  cert_file: \"${CERT_FILE}\"
+  key_file: \"${KEY_FILE}\""
+    fi
+
+    # 生成配置文件
+    cat >"${CONFIG_FILE}" <<EOF
+# AnytlsServer 配置文件 - 独立模式
+# 由安装脚本自动生成
+
+standalone: true
+password: "${password}"
+listen: "0.0.0.0:${listen_port}"
+node_type: "anytls"
+
+# TLS 配置
+${cert_config}
+
+# 日志配置
+log:
+  level: "info"
+  file_path: "${LOG_FILE}"
+
+# Fallback 配置（认证失败时转发到此地址）
+fallback: "127.0.0.1:80"
+EOF
+
+    chmod 600 "${CONFIG_FILE}"
+    echoContent green "\n配置文件已生成：${CONFIG_FILE}"
+
+    # 申请证书
+    if [[ -n "${domain}" ]]; then
+        apply_cert "${domain}"
+    else
+        echoContent yellow "跳过证书申请，将使用自签名证书"
+    fi
+
+    # 配置防火墙
+    setup_firewall "${listen_port}"
+
+    # 显示分享链接
+    show_share_link "${password}" "${listen_port}" "${domain}"
+}
+
+# Xboard 模式配置
+setup_xboard_config() {
+    echoContent skyBlue "\n配置 Xboard 模式..."
     echoContent red "=============================================================="
 
     # 输入域名
@@ -368,7 +496,6 @@ setup_config() {
             echoContent red "面板地址不能为空"
         fi
     done
-    # 去除末尾斜杠
     api_host="${api_host%/}"
 
     # 输入 token
@@ -396,25 +523,23 @@ setup_config() {
         listen_port="${input_port}"
     fi
 
-    # 创建配置目录
+    # 创建目录
     mkdir -p "${CONFIG_DIR}"
     mkdir -p "${LOG_DIR}"
 
-    # 确定 TLS 配置
-    local cert_config=""
+    # TLS 配置
+    local cert_config="tls:
+  cert_file: \"\"
+  key_file: \"\""
     if [[ -n "${domain}" ]]; then
         cert_config="tls:
   cert_file: \"${CERT_FILE}\"
   key_file: \"${KEY_FILE}\""
-    else
-        cert_config="tls:
-  cert_file: \"\"
-  key_file: \"\""
     fi
 
     # 生成配置文件
     cat >"${CONFIG_FILE}" <<EOF
-# AnytlsServer 配置文件
+# AnytlsServer 配置文件 - Xboard 模式
 # 由安装脚本自动生成
 
 listen: "0.0.0.0:${listen_port}"
@@ -437,9 +562,7 @@ log:
 fallback: "127.0.0.1:80"
 EOF
 
-    # 设置配置文件权限为 600（仅 owner 可读写）
     chmod 600 "${CONFIG_FILE}"
-
     echoContent green "\n配置文件已生成：${CONFIG_FILE}"
 
     # 申请证书
@@ -457,6 +580,46 @@ EOF
 
     # 显示 Xboard 节点配置说明
     show_xboard_guide "${listen_port}" "${domain}"
+}
+
+# 配置向导（兼容旧入口）
+setup_config() {
+    choose_install_mode
+}
+
+# 显示分享链接
+show_share_link() {
+    local password="$1"
+    local port="$2"
+    local domain="${3:-}"
+
+    local server_ip
+    server_ip=$(get_public_ip)
+    local host="${domain:-${server_ip:-YOUR_SERVER_IP}}"
+    local sni_param=""
+    local sni_line=""
+    if [[ -n "${domain}" ]]; then
+        sni_param="&sni=${domain}"
+        sni_line="    sni: \"${domain}\""
+    fi
+
+    echoContent red "\n=============================================================="
+    echoContent green "========== AnyTLS 分享链接 =========="
+    echoContent skyBlue "anytls://${password}@${host}:${port}/?insecure=1${sni_param}"
+    echoContent green "======================================"
+    echoContent green ""
+    echoContent green "FlClash / Clash.Meta 配置片段："
+    echoContent yellow "  - name: \"anytls-node\""
+    echoContent yellow "    type: anytls"
+    echoContent yellow "    server: ${host}"
+    echoContent yellow "    port: ${port}"
+    echoContent yellow "    password: \"${password}\""
+    echoContent yellow "    udp: true"
+    echoContent yellow "    skip-cert-verify: true"
+    if [[ -n "${sni_line}" ]]; then
+        echoContent yellow "${sni_line}"
+    fi
+    echoContent red "=============================================================="
 }
 
 # 测试 API 连接
@@ -515,6 +678,8 @@ modify_config() {
     echoContent yellow "请选择要修改的项目："
     echoContent yellow "1. 使用编辑器打开配置文件"
     echoContent yellow "2. 重新运行配置向导"
+    echoContent yellow "3. 修改密码（独立模式）"
+    echoContent yellow "4. 修改端口"
     echoContent red "=============================================================="
 
     read -r -p "请选择: " modify_choice
@@ -529,12 +694,95 @@ modify_config() {
         echoContent green "配置已修改，请重启服务使其生效"
         ;;
     2)
-        setup_config
+        choose_install_mode
+        echoContent yellow "请重启服务使新配置生效: systemctl restart ${SERVICE_NAME}"
+        ;;
+    3)
+        modify_password
+        ;;
+    4)
+        modify_port
         ;;
     *)
         echoContent red "无效选择"
         ;;
     esac
+}
+
+# 修改密码（独立模式）
+modify_password() {
+    local is_standalone
+    is_standalone=$(get_config_value "standalone")
+    if [[ "${is_standalone}" != "true" ]]; then
+        echoContent red "Xboard 模式下密码由面板管理，无需手动修改"
+        return
+    fi
+
+    local current_password
+    current_password=$(get_config_value "password")
+    echoContent yellow "当前密码：${current_password}"
+
+    read -r -p "请输入新密码（留空随机生成）: " new_password
+    if [[ -z "${new_password}" ]]; then
+        new_password=$(generate_password)
+    fi
+
+    sed -i "s|^password:.*|password: \"${new_password}\"|" "${CONFIG_FILE}"
+    echoContent green "密码已修改为：${new_password}"
+    echoContent yellow "正在重启服务..."
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+
+    # 显示新的分享链接
+    local listen_port
+    listen_port=$(get_config_value "listen" | grep -oP ':\K[0-9]+')
+    show_share_link "${new_password}" "${listen_port}" ""
+}
+
+# 修改端口
+modify_port() {
+    local current_listen
+    current_listen=$(get_config_value "listen")
+    echoContent yellow "当前监听地址：${current_listen}"
+
+    read -r -p "请输入新端口: " new_port
+    if [[ ! "${new_port}" =~ ^[0-9]+$ ]]; then
+        echoContent red "端口必须为数字"
+        return
+    fi
+
+    sed -i "s|^listen:.*|listen: \"0.0.0.0:${new_port}\"|" "${CONFIG_FILE}"
+    setup_firewall "${new_port}"
+    echoContent green "端口已修改为：${new_port}"
+    echoContent yellow "正在重启服务..."
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+}
+
+# 查看当前配置和分享链接
+show_config_info() {
+    if [[ ! -f "${CONFIG_FILE}" ]]; then
+        echoContent red "错误：配置文件不存在，请先安装"
+        return
+    fi
+
+    local is_standalone
+    is_standalone=$(get_config_value "standalone")
+
+    if [[ "${is_standalone}" == "true" ]]; then
+        echoContent green "运行模式：独立模式"
+        local password
+        password=$(get_config_value "password")
+        local listen_port
+        listen_port=$(get_config_value "listen" | grep -oP ':\K[0-9]+')
+        echoContent yellow "密码：${password}"
+        echoContent yellow "端口：${listen_port}"
+        show_share_link "${password}" "${listen_port}" ""
+    else
+        echoContent green "运行模式：Xboard 模式"
+        echoContent yellow "面板地址：$(get_config_value 'api_host')"
+        echoContent yellow "节点 ID：$(get_config_value 'node_id')"
+        echoContent yellow "端口：$(get_config_value 'listen' | grep -oP ':\K[0-9]+')"
+        echoContent yellow "密码由 Xboard 面板管理"
+    fi
 }
 
 # ============================================================
@@ -715,7 +963,8 @@ show_menu() {
     echoContent yellow "8. 查看日志"
     echoContent skyBlue "------------------------配置管理------------------------------"
     echoContent yellow "9. 修改配置"
-    echoContent yellow "10. 证书续期"
+    echoContent yellow "10. 查看配置/分享链接"
+    echoContent yellow "11. 证书续期"
     echoContent red "=============================================================="
     echoContent yellow "0. 退出"
     echoContent red "=============================================================="
@@ -752,6 +1001,9 @@ show_menu() {
         modify_config
         ;;
     10)
+        show_config_info
+        ;;
+    11)
         renew_cert
         ;;
     0)
