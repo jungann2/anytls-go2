@@ -52,9 +52,8 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("加载 TLS 配置失败: %w", err)
 	}
 
-	return &Server{
+	s := &Server{
 		config:         cfg,
-		apiClient:      api.NewClient(cfg.APIHost, cfg.APIToken, cfg.NodeID, cfg.NodeType, logger),
 		userManager:    user.NewManager(),
 		trafficCounter: traffic.NewCounter(),
 		speedLimiter:   ratelimit.NewSpeedLimiter(),
@@ -63,48 +62,63 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		fallback:       fallback.NewHandler(cfg.Fallback),
 		tlsConfig:      tlsCfg,
 		logger:         logger,
-	}, nil
+	}
+
+	// Xboard 模式才创建 API 客户端
+	if !cfg.Standalone {
+		s.apiClient = api.NewClient(cfg.APIHost, cfg.APIToken, cfg.NodeID, cfg.NodeType, logger)
+	}
+
+	return s, nil
 }
 
 // Start 启动服务
-// 流程：FetchConfig → FetchUsers → 启动 listener → 启动 syncLoop → accept loop
+// Xboard 模式：FetchConfig → FetchUsers → 启动 listener → 启动 syncLoop → accept loop
+// Standalone 模式：加载本地密码用户 → 启动 listener → accept loop
 func (s *Server) Start(ctx context.Context) error {
-	// 1. 获取节点配置
-	nodeConfig, err := s.apiClient.FetchConfig()
-	if err != nil {
-		return fmt.Errorf("获取节点配置失败: %w", err)
-	}
-	s.nodeConfig = nodeConfig
-	s.logger.WithFields(logrus.Fields{
-		"server_port":   nodeConfig.ServerPort,
-		"push_interval": nodeConfig.BaseConfig.PushInterval,
-		"pull_interval": nodeConfig.BaseConfig.PullInterval,
-	}).Info("节点配置已加载")
-
-	// 2. 拉取用户列表
-	users, err := s.apiClient.FetchUsers()
-	if err != nil {
-		return fmt.Errorf("拉取用户列表失败: %w", err)
-	}
-	if users != nil {
-		s.userManager.UpdateUsers(users)
-		s.logger.WithField("count", len(users)).Info("用户列表已加载")
-	}
-
-	// 3. 确定监听地址：API 返回的 server_port 优先
 	listenAddr := s.config.Listen
-	if nodeConfig.ServerPort > 0 {
-		_, _, err := net.SplitHostPort(listenAddr)
+
+	if s.config.Standalone {
+		// 独立模式：用本地密码创建单用户
+		s.userManager.UpdateUsers([]api.User{
+			{ID: 1, UUID: s.config.Password},
+		})
+		s.logger.Info("独立模式启动，已加载本地密码用户")
+	} else {
+		// Xboard 模式：从 API 获取配置和用户
+		nodeConfig, err := s.apiClient.FetchConfig()
 		if err != nil {
-			// listenAddr 不含端口，直接拼接
-			listenAddr = fmt.Sprintf("%s:%d", listenAddr, nodeConfig.ServerPort)
-		} else {
-			host, _, _ := net.SplitHostPort(listenAddr)
-			listenAddr = fmt.Sprintf("%s:%d", host, nodeConfig.ServerPort)
+			return fmt.Errorf("获取节点配置失败: %w", err)
+		}
+		s.nodeConfig = nodeConfig
+		s.logger.WithFields(logrus.Fields{
+			"server_port":   nodeConfig.ServerPort,
+			"push_interval": nodeConfig.BaseConfig.PushInterval,
+			"pull_interval": nodeConfig.BaseConfig.PullInterval,
+		}).Info("节点配置已加载")
+
+		users, err := s.apiClient.FetchUsers()
+		if err != nil {
+			return fmt.Errorf("拉取用户列表失败: %w", err)
+		}
+		if users != nil {
+			s.userManager.UpdateUsers(users)
+			s.logger.WithField("count", len(users)).Info("用户列表已加载")
+		}
+
+		// API 返回的 server_port 优先
+		if nodeConfig.ServerPort > 0 {
+			_, _, err := net.SplitHostPort(listenAddr)
+			if err != nil {
+				listenAddr = fmt.Sprintf("%s:%d", listenAddr, nodeConfig.ServerPort)
+			} else {
+				host, _, _ := net.SplitHostPort(listenAddr)
+				listenAddr = fmt.Sprintf("%s:%d", host, nodeConfig.ServerPort)
+			}
 		}
 	}
 
-	// 4. 启动 TCP listener
+	// 启动 TCP listener
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("监听 %s 失败: %w", listenAddr, err)
@@ -112,18 +126,19 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = ln
 	s.logger.WithField("addr", listenAddr).Info("服务已启动")
 
-	// 5. 启动 syncLoop
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.syncLoop(ctx)
-	}()
+	// Xboard 模式启动 syncLoop
+	if !s.config.Standalone {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.syncLoop(ctx)
+		}()
+	}
 
-	// 6. Accept loop
+	// Accept loop
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// listener 被关闭时退出循环
 			select {
 			case <-ctx.Done():
 				return nil
@@ -157,15 +172,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.listener.Close()
 	}
 
-	// 2. 快照流量并上报
-	snapshot := s.trafficCounter.Snapshot()
-	if len(snapshot) > 0 {
-		if err := s.apiClient.PushTraffic(snapshot); err != nil {
-			s.logger.WithError(err).Error("关闭时上报流量失败")
-			// 上报失败，合并回计数器以便持久化
-			s.trafficCounter.Merge(snapshot)
-		} else {
-			s.logger.WithField("users", len(snapshot)).Info("关闭时流量已上报")
+	// 2. Xboard 模式：快照流量并上报
+	if !s.config.Standalone {
+		snapshot := s.trafficCounter.Snapshot()
+		if len(snapshot) > 0 {
+			if err := s.apiClient.PushTraffic(snapshot); err != nil {
+				s.logger.WithError(err).Error("关闭时上报流量失败")
+				s.trafficCounter.Merge(snapshot)
+			} else {
+				s.logger.WithField("users", len(snapshot)).Info("关闭时流量已上报")
+			}
 		}
 	}
 

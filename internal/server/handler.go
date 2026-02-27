@@ -90,8 +90,8 @@ func (s *Server) handleConnection(ctx context.Context, c net.Conn) {
 		}
 	}
 
-	// 6. 检查设备限制
-	if userEntry.DeviceLimit > 0 {
+	// 6. 检查设备限制（仅 Xboard 模式）
+	if userEntry.DeviceLimit > 0 && s.apiClient != nil {
 		aliveList, err := s.apiClient.FetchAliveList()
 		if err != nil {
 			s.logger.WithError(err).Warn("获取在线设备数失败，跳过设备限制检查")
