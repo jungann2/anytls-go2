@@ -36,7 +36,7 @@ SERVICE_NAME="anytls"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # GitHub Release 下载地址
-GITHUB_REPO="anytls/anytls-go"
+GITHUB_REPO="jungann2/anytls-go2"
 DOWNLOAD_URL_BASE="https://github.com/${GITHUB_REPO}/releases/latest/download"
 
 # 系统信息
