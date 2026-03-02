@@ -20,6 +20,10 @@
 
 ```bash
 # 第一步：更新系统并安装必要依赖
+# root 用户执行：
+apt update -y && apt install -y curl socat wget
+
+# 非 root 用户执行：
 sudo apt update -y && sudo apt install -y curl socat wget
 
 # 第二步：运行一键安装脚本
