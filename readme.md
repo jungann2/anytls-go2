@@ -20,7 +20,7 @@
 
 ```bash
 # 第一步：更新系统并安装必要依赖
-apt update -y && apt install -y curl socat wget
+sudo apt update -y && sudo apt install -y curl socat wget
 
 # 第二步：运行一键安装脚本
 bash <(curl -sL https://raw.githubusercontent.com/jungann2/anytls-go2/main/install.sh) install
